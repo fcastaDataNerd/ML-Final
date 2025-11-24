@@ -424,3 +424,69 @@ def test_random_board(split="train"):
 
 # 🚀 RUN IT!
 result = test_random_board("train")
+
+#Part 6
+
+from itertools import combinations
+
+# ======================================================
+#   🔢 Numeric Encoding for Solver
+# ======================================================
+encode_num   = {"One":0, "Two":1, "Three":2}
+encode_fill  = {"Open":0, "Shaded":1, "Solid":2}
+encode_color = {"Green":0, "Purple":1, "Red":2}
+encode_shape = {"Diamond":0, "Oval":1, "Squiggle":2}
+
+def encode_card(card):
+    """Convert card attributes dict into numeric tuple"""
+    return (
+        encode_num[card["Number"]],
+        encode_fill[card["Fill"]],
+        encode_color[card["Color"]],
+        encode_shape[card["Shape"]]
+    )
+
+# ======================================================
+#   ✔️ Check if 3 cards form a SET
+# ======================================================
+def is_set(c1, c2, c3):
+    """A set occurs if each attribute is all same or all different."""
+    return all((c1[i] + c2[i] + c3[i]) % 3 == 0 for i in range(4))
+
+# ======================================================
+#   🔍 Find ALL SETS on the board
+# ======================================================
+def find_sets(card_dict):
+    """Return all (card1, card2, card3) that form a SET."""
+    encoded = {k: encode_card(v) for k, v in card_dict.items()}
+    keys = list(encoded.keys())
+    sets_found = []
+
+    for a, b, c in combinations(keys, 3):
+        if is_set(encoded[a], encoded[b], encoded[c]):
+            sets_found.append((a, b, c))
+    return sets_found
+
+# ======================================================
+#   🚀 Solve SET for board_92
+# ======================================================
+solution_sets = find_sets(result)
+
+print("\n🎉 SETS FOUND on set_92.jpg:")
+if len(solution_sets) == 0:
+    print("🚫 No sets on this board.")
+else:
+    for s in solution_sets:
+        print("✔️ SET:", s)
+
+# ======================================================
+#   🧾 Show Attribute Details
+# ======================================================
+if len(solution_sets) > 0:
+    print("\n📌 Detailed SETs:")
+    for s in solution_sets:
+        a, b, c = s
+        print(f"\n➡️ SET: {s}")
+        print(" ", a, "→", result[a])
+        print(" ", b, "→", result[b])
+        print(" ", c, "→", result[c])
