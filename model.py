@@ -283,7 +283,9 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Conv2D, MaxPool2D, Flatten, Dense, Rescaling
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from tensorflow.keras.utils import img_to_array, load_img
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from sklearn.model_selection import train_test_split
+from sklearn.utils import shuffle
 
 # =========================================================
 # PATHS
@@ -350,9 +352,61 @@ print("Image array shape:", X.shape)
 # =========================================================
 X_train, X_val, yn_train, yn_val, yf_train, yf_val, yc_train, yc_val, ys_train, ys_val = \
     train_test_split(
-        X, y_num, y_fill, y_color, y_shape, 
-        test_size=0.20, random_state=42
+        X, y_num, y_fill, y_color, y_shape,
+        test_size=0.20, random_state=42, stratify=y_num
     )
+
+print(f"Train samples before augmentation: {len(X_train)}, Val samples: {len(X_val)}")
+
+# =========================================================
+# DATA AUGMENTATION (applied to training set only)
+# =========================================================
+N_AUG_PER_IMAGE = 20
+
+datagen = ImageDataGenerator(
+    rotation_range=15,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    zoom_range=0.15,
+    brightness_range=[0.8, 1.2],
+    fill_mode='nearest'
+)
+
+X_train_aug = []
+yn_train_aug = []
+yf_train_aug = []
+yc_train_aug = []
+ys_train_aug = []
+
+print("\nAugmenting training dataset...")
+for i in range(len(X_train)):
+    X_train_aug.append(X_train[i])
+    yn_train_aug.append(yn_train[i])
+    yf_train_aug.append(yf_train[i])
+    yc_train_aug.append(yc_train[i])
+    ys_train_aug.append(ys_train[i])
+
+    img = X_train[i].reshape((1,) + X_train[i].shape)
+    aug_iter = datagen.flow(img, batch_size=1)
+    for j in range(N_AUG_PER_IMAGE - 1):
+        aug_img = next(aug_iter)[0]
+        X_train_aug.append(aug_img)
+        yn_train_aug.append(yn_train[i])
+        yf_train_aug.append(yf_train[i])
+        yc_train_aug.append(yc_train[i])
+        ys_train_aug.append(ys_train[i])
+
+X_train_aug = np.array(X_train_aug, dtype=np.float32)
+yn_train_aug = np.array(yn_train_aug, dtype=np.int32)
+yf_train_aug = np.array(yf_train_aug, dtype=np.int32)
+yc_train_aug = np.array(yc_train_aug, dtype=np.int32)
+ys_train_aug = np.array(ys_train_aug, dtype=np.int32)
+
+X_train_aug, yn_train_aug, yf_train_aug, yc_train_aug, ys_train_aug = shuffle(
+    X_train_aug, yn_train_aug, yf_train_aug, yc_train_aug, ys_train_aug, random_state=42
+)
+
+print(f"Train samples after augmentation: {len(X_train_aug)} (augmentation factor ≈ {N_AUG_PER_IMAGE})")
 
 # =========================================================
 # BUILD MULTI-OUTPUT CNN (colleague 2’s architecture)
@@ -394,8 +448,8 @@ callbacks = [
 ]
 
 history = model.fit(
-    X_train,
-    [yn_train, yf_train, yc_train, ys_train],
+    X_train_aug,
+    [yn_train_aug, yf_train_aug, yc_train_aug, ys_train_aug],
     validation_data=(X_val, [yn_val, yf_val, yc_val, ys_val]),
     epochs=25,
     batch_size=32,
