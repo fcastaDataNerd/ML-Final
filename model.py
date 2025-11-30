@@ -1,8 +1,11 @@
-#Part 1
+# ============================================================
+# PART 1 — Realistic Synthetic SET Board Generator
+# ============================================================
+
 import os
 from pathlib import Path
 import random
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
 from tqdm import tqdm
 import csv
@@ -10,18 +13,18 @@ import csv
 # ================================
 # CONFIGURE PATHS
 # ================================
-CARDS_DIR = Path(r"C:\Users\franc\Downloads\SET Dataset\SET Dataset") #original 81 card dataset
+CARDS_DIR = Path(r"C:\Users\franc\Downloads\SET Dataset\SET Dataset")
 OUT_DIR   = Path(r"C:\Users\franc\Downloads\SET_synth_clean")
 
 # ================================
 # GENERATION SETTINGS
 # ================================
-N_IMAGES = 200          # Number of 3×4 synthetic boards
+N_IMAGES = 200
 VAL_SPLIT = 0.15
 
 IMG_W, IMG_H = 1800, 1200
 GRID_ROWS, GRID_COLS = 3, 4
-CARD_W, CARD_H = 350, 300
+CARD_W, CARD_H = 350, 300   # Base size, will be jittered
 PADDING_X, PADDING_Y = 80, 60
 
 random.seed(42)
@@ -35,57 +38,138 @@ for sub in ["images/train", "images/val"]:
 cards = [p for p in CARDS_DIR.iterdir() if p.suffix.lower() in (".jpg", ".jpeg")]
 
 # ================================
-# BACKGROUND + AUGMENTATION HELPERS
+# BACKGROUND GENERATION
 # ================================
-def dark_background(w, h):
-    base = np.ones((h, w, 3), dtype=np.uint8) * np.random.randint(30, 60)
-    noise = (np.random.randn(h, w, 3) * 5).astype(np.int16)
-    return Image.fromarray(np.clip(base + noise, 0, 255).astype(np.uint8))
+def random_background(w, h):
+    """Simulate real surfaces: wood, felt, paper, etc."""
+    base_color = np.random.randint(120, 200)
+    base = np.ones((h, w, 3), dtype=np.uint8) * base_color
+    
+    # Add subtle texture
+    noise = (np.random.randn(h, w, 3) * np.random.randint(6, 15)).astype(np.int16)
+    img = np.clip(base + noise, 0, 255)
+    
+    return Image.fromarray(img.astype(np.uint8))
 
-def add_variations(card):
+
+# ================================
+# CARD AUGMENTATION
+# ================================
+def augment_card(card):
+    """Apply strong augmentations to simulate real-world photography."""
+    
+    # Random resize jitter
+    scale = random.uniform(0.92, 1.08)
+    w = int(CARD_W * scale)
+    h = int(CARD_H * scale)
+    card = card.resize((w, h), Image.BICUBIC)
+
+    # Rotation (±10 degrees)
+    angle = random.uniform(-10, 10)
+    card = card.rotate(angle, expand=True)
+
+    # Color jitter (temperature shift)
+    if random.random() < 0.7:
+        temp_shift = random.uniform(0.85, 1.15)
+        card = ImageEnhance.Color(card).enhance(temp_shift)
+
+    # Brightness & contrast
+    if random.random() < 0.7:
+        card = ImageEnhance.Brightness(card).enhance(random.uniform(0.8, 1.2))
+    if random.random() < 0.7:
+        card = ImageEnhance.Contrast(card).enhance(random.uniform(0.8, 1.2))
+
+    # Optional blur (simulates camera focus issues)
+    if random.random() < 0.3:
+        card = card.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 1.3)))
+
+    # Add noise
     if random.random() < 0.5:
-        card = ImageEnhance.Brightness(card).enhance(random.uniform(0.95, 1.05))
-    if random.random() < 0.5:
-        card = ImageEnhance.Contrast(card).enhance(random.uniform(0.95, 1.05))
+        arr = np.array(card)
+        noise = np.random.normal(0, 8, arr.shape)
+        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+        card = Image.fromarray(arr)
+
     return card
 
+
 # ================================
-# NEW ➤ SAVE METADATA FILE
+# SHADOW GENERATOR
+# ================================
+def apply_shadow(canvas):
+    """Add soft random shadow over the board."""
+    if random.random() > 0.7:
+        return canvas
+
+    w, h = canvas.size
+    shadow = Image.new("RGB", (w, h), (0, 0, 0))
+    mask = Image.new("L", (w, h), 0)
+
+    # Shadow ellipse
+    rx = random.randint(400, 900)
+    ry = random.randint(300, 600)
+    cx = random.randint(0, w)
+    cy = random.randint(0, h)
+
+    for y in range(h):
+        for x in range(w):
+            if ((x - cx)**2) / (rx**2) + ((y - cy)**2) / (ry**2) <= 1:
+                mask.putpixel((x, y), random.randint(30, 80))
+
+    shadow = Image.composite(shadow, canvas, mask)
+    return shadow
+
+
+# ================================
+# METADATA FILE
 # ================================
 meta_file = OUT_DIR / "board_metadata.csv"
 with open(meta_file, "w", newline='') as f:
     writer = csv.writer(f)
-    writer.writerow(["board_filename"] + [f"slot_{i}" for i in range(1,13)])
+    writer.writerow(["board_filename"] + [f"slot_{i}" for i in range(1, 13)])
+
 
 # ================================
-# GENERATE SYNTHETIC 12 CARD GRIDS
+# GENERATE REALISTIC BOARDS
 # ================================
 for idx in tqdm(range(N_IMAGES)):
     split = "val" if idx < N_IMAGES * VAL_SPLIT else "train"
-    canvas = dark_background(IMG_W, IMG_H)
+    canvas = random_background(IMG_W, IMG_H)
 
     selected_cards = random.sample(cards, GRID_ROWS * GRID_COLS)
 
     for i, card_path in enumerate(selected_cards):
         r, c = divmod(i, GRID_COLS)
-        x = PADDING_X + c * (CARD_W + PADDING_X)
-        y = PADDING_Y + r * (CARD_H + PADDING_Y)
 
-        card = Image.open(card_path).resize((CARD_W, CARD_H)).convert("RGB")
-        card = add_variations(card)
-        canvas.paste(card, (x, y))
+        # Base grid position with random jitter
+        base_x = PADDING_X + c * (CARD_W + PADDING_X)
+        base_y = PADDING_Y + r * (CARD_H + PADDING_Y)
+
+        jitter_x = random.randint(-15, 15)
+        jitter_y = random.randint(-15, 15)
+
+        x = base_x + jitter_x
+        y = base_y + jitter_y
+
+        card = Image.open(card_path).convert("RGB")
+        card = augment_card(card)
+
+        canvas.paste(card, (x, y), card if "A" in card.mode else None)
+
+    # Apply shadows
+    canvas = apply_shadow(canvas)
 
     filename = f"set_{idx}.jpg"
     out_file = OUT_DIR / f"images/{split}/{filename}"
     canvas.save(out_file)
 
-    # SAVE THE FILEPATHS OF 12 CARDS
+    # Save metadata row
     with open(meta_file, "a", newline='') as f:
         writer = csv.writer(f)
         writer.writerow([filename] + [p.name for p in selected_cards])
 
-print("\n🎉 Synthetic boards + metadata generated successfully!")
-print("📌 Metadata file saved at:", meta_file)
+print("\n🎉 Realistic synthetic boards + metadata generated!")
+print("📌 Metadata saved at:", meta_file)
 
 
 #Part 2
