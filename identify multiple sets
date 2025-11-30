@@ -1,47 +1,49 @@
-!unzip "/content/SET Dataset.zip"
+# ================================
+# FULL SET DETECTION PIPELINE
+# ================================
 
-import os
-from pathlib import Path
+# !pip install ultralytics -q
 import random
-from PIL import Image, ImageEnhance
+from pathlib import Path
+from itertools import combinations
 import numpy as np
+import pandas as pd
+import cv2
+from PIL import Image, ImageEnhance
+import matplotlib.pyplot as plt
+import yaml
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.layers import Input, Conv2D, MaxPool2D, Flatten, Dense, Rescaling
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.model_selection import train_test_split
+from ultralytics import YOLO
+import torch
 from tqdm import tqdm
 import csv
-import cv2
-import pandas as pd
-import keras
-from tensorflow.keras.models import Model, load_model
-from tensorflow.keras.layers import Input, Conv2D, MaxPool2D, Flatten, Dense, Rescaling
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.utils import img_to_array, load_img
-from sklearn.model_selection import train_test_split
-from itertools import combinations
-import matplotlib.pyplot as plt
+import os
 
 # ================================
 # CONFIGURATION
 # ================================
 CARDS_DIR = Path("/content/SET Dataset")
-OUT_DIR = Path("/content/SET_synth_clean")
-
+OUT_DIR   = Path("/content/SET_synth_clean")
 N_IMAGES = 200
 VAL_SPLIT = 0.15
-
 IMG_W, IMG_H = 1800, 1200
 GRID_ROWS, GRID_COLS = 3, 4
 CARD_W, CARD_H = 350, 300
 PADDING_X, PADDING_Y = 80, 60
-
 random.seed(42)
 
 # ================================
-# STEP 1: GENERATE SYNTHETIC DATA WITH YOLO LABELS + METADATA
+# STEP 1: GENERATE SYNTHETIC DATA
 # ================================
 print("\n" + "="*60)
-print("STEP 1: Generating Synthetic Boards")
+print("STEP 1: Generating Synthetic Data")
 print("="*60)
 
-# Create output folders
 for sub in ["images/train", "images/val", "labels/train", "labels/val"]:
     (OUT_DIR / sub).mkdir(parents=True, exist_ok=True)
 
@@ -66,18 +68,15 @@ def yolo_format(xmin, ymin, xmax, ymax, W, H):
     h = (ymax - ymin) / H
     return xc, yc, w, h
 
-# Create metadata CSV
 meta_file = OUT_DIR / "board_metadata.csv"
 with open(meta_file, "w", newline='') as f:
     writer = csv.writer(f)
     writer.writerow(["board_filename"] + [f"slot_{i}" for i in range(1, 13)])
 
-# Generate synthetic boards
 for idx in tqdm(range(N_IMAGES), desc="Generating boards"):
     split = "val" if idx < N_IMAGES * VAL_SPLIT else "train"
     canvas = dark_background(IMG_W, IMG_H)
     labels = []
-
     selected_cards = random.sample(cards, GRID_ROWS * GRID_COLS)
 
     for r in range(GRID_ROWS):
@@ -89,42 +88,33 @@ for idx in tqdm(range(N_IMAGES), desc="Generating boards"):
             x = PADDING_X + c * (CARD_W + PADDING_X)
             y = PADDING_Y + r * (CARD_H + PADDING_Y)
 
-            # Bounds check
             if x + CARD_W > IMG_W or y + CARD_H > IMG_H:
                 continue
 
             canvas.paste(card, (x, y))
-
             xmin, ymin = x, y
             xmax, ymax = x + CARD_W, y + CARD_H
-
             xc, yc, w, h = yolo_format(xmin, ymin, xmax, ymax, IMG_W, IMG_H)
+            labels.append(f"0 {xc} {yc} {w} {h}")
 
-            # Ensure all values in [0,1]
-            if 0 <= xc <= 1 and 0 <= yc <= 1 and 0 <= w <= 1 and 0 <= h <= 1:
-                labels.append(f"0 {xc} {yc} {w} {h}")
-
-    # Save image and YOLO labels
     filename = f"set_{idx}.jpg"
     img_out = OUT_DIR / f"images/{split}/{filename}"
     lbl_out = OUT_DIR / f"labels/{split}/{filename[:-4]}.txt"
-
     canvas.save(img_out)
     with open(lbl_out, "w") as f:
         f.write("\n".join(labels))
 
-    # Save metadata
     with open(meta_file, "a", newline='') as f:
         writer = csv.writer(f)
         writer.writerow([filename] + [p.name for p in selected_cards])
 
-print("✓ Synthetic boards + YOLO labels + metadata generated")
+print("✓ Synthetic boards + YOLO labels generated")
 
 # ================================
-# STEP 2: CROP CARDS AND CREATE LABELS
+# STEP 2: CROP CARDS
 # ================================
 print("\n" + "="*60)
-print("STEP 2: Cropping Cards from Boards")
+print("STEP 2: Cropping Cards")
 print("="*60)
 
 IMG_DIR = OUT_DIR / "images"
@@ -132,42 +122,91 @@ CROP_DIR = OUT_DIR / "cropped_cards"
 CROP_DIR.mkdir(exist_ok=True)
 
 df = pd.read_csv(meta_file)
-
-crop_filenames = []
-labels = []
+crop_filenames, labels = [], []
 
 for idx, row in tqdm(df.iterrows(), total=len(df), desc="Cropping cards"):
     board_file = row['board_filename']
     slots = row[1:].values
-
-    if (IMG_DIR / "train" / board_file).exists():
-        board_path = IMG_DIR / "train" / board_file
-    else:
-        board_path = IMG_DIR / "val" / board_file
-
-    full = cv2.imread(str(board_path))
-    full = cv2.cvtColor(full, cv2.COLOR_BGR2RGB)
+    board_path = IMG_DIR / "train" / board_file if (IMG_DIR / "train" / board_file).exists() else IMG_DIR / "val" / board_file
+    full = cv2.cvtColor(cv2.imread(str(board_path)), cv2.COLOR_BGR2RGB)
 
     for i, label in enumerate(slots):
         r, c = divmod(i, GRID_COLS)
-
         x1 = PADDING_X + c * (CARD_W + PADDING_X)
         y1 = PADDING_Y + r * (CARD_H + PADDING_Y)
-        x2 = x1 + CARD_W
-        y2 = y1 + CARD_H
+        x2, y2 = x1 + CARD_W, y1 + CARD_H
 
         crop = full[y1:y2, x1:x2]
         crop_name = f"{board_file[:-4]}_slot{i+1}.jpg"
-
         cv2.imwrite(str(CROP_DIR / crop_name), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
-
         crop_filenames.append(crop_name)
         labels.append(label)
 
-label_df = pd.DataFrame({"filename": crop_filenames, "label_filename": labels})
-label_df.to_csv(OUT_DIR / "cropped_card_labels.csv", index=False)
+pd.DataFrame({"filename": crop_filenames, "label_filename": labels}).to_csv(OUT_DIR / "cropped_card_labels.csv", index=False)
+print("✓ Cards cropped")
 
-print("✓ Cards cropped and labeled")
+# ================================
+# STEP 2b: OPENCV CARD EXTRACTOR (OPTIONAL)
+# ================================
+def order_points(pts):
+    pts = pts.reshape(4, 2)
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def extract_cards_opencv(image_path, output_dir=None):
+    """Extract cards using OpenCV contour detection (alternative method)"""
+    if output_dir is None:
+        output_dir = OUT_DIR / "opencv_extracted_cards"
+    os.makedirs(output_dir, exist_ok=True)
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        print(f"⚠️ Image not found: {image_path}")
+        return 0
+
+    orig_image = image.copy()
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    # Dilate edges to close gaps
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    edges = cv2.dilate(edges, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    card_count = 0
+    for cnt in contours:
+        epsilon = 0.02 * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        if len(approx) == 4 and cv2.contourArea(approx) > 1000:
+            rect = order_points(approx)
+            width = int(max(np.linalg.norm(rect[0]-rect[1]), np.linalg.norm(rect[2]-rect[3])))
+            height = int(max(np.linalg.norm(rect[0]-rect[3]), np.linalg.norm(rect[1]-rect[2])))
+            dst = np.array([[0,0],[width-1,0],[width-1,height-1],[0,height-1]], dtype="float32")
+            M = cv2.getPerspectiveTransform(rect, dst)
+            warp = cv2.warpPerspective(orig_image, M, (width, height))
+            card_count += 1
+            cv2.imwrite(str(output_dir / f"card_{card_count}.png"), warp)
+            cv2.drawContours(image, [approx], -1, (0,255,0), 2)
+
+    # Display result (use cv2_imshow in Colab or cv2.imshow locally)
+    try:
+        from google.colab.patches import cv2_imshow
+        cv2_imshow(image)
+    except:
+        cv2.imshow("Detected Cards", image)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    print(f"✓ Total cards extracted via OpenCV: {card_count}")
+    return card_count
 
 # ================================
 # STEP 3: PARSE CARD ATTRIBUTES
@@ -176,57 +215,38 @@ print("\n" + "="*60)
 print("STEP 3: Parsing Card Attributes")
 print("="*60)
 
-LABEL_CSV = OUT_DIR / "cropped_card_labels.csv"
-df = pd.read_csv(LABEL_CSV)
-
 def parse_label(name):
-    name = name.replace(".jpg", "").replace(".jpeg", "")
-    parts = name.split("_")
-    return parts  # [Number, Fill, Color, Shape]
+    return name.replace(".jpg","").replace(".jpeg","").split("_")  # [Number, Fill, Color, Shape]
 
-df[['number', 'fill', 'color', 'shape']] = df['label_filename'].apply(
-    lambda x: pd.Series(parse_label(x))
-)
-
-out_csv = OUT_DIR / "cropped_card_labels_parsed.csv"
-df.to_csv(out_csv, index=False)
-
-print("✓ Attributes parsed")
-print(df.head())
+df = pd.read_csv(OUT_DIR / "cropped_card_labels.csv")
+df[['number','fill','color','shape']] = df['label_filename'].apply(lambda x: pd.Series(parse_label(x)))
+df.to_csv(OUT_DIR / "cropped_card_labels_parsed.csv", index=False)
+print("✓ Card attributes parsed")
 
 # ================================
-# STEP 4: TRAIN CNN FOR CARD CLASSIFICATION
+# STEP 4: TRAIN CNN
 # ================================
 print("\n" + "="*60)
-print("STEP 4: Training Multi-Output CNN")
+print("STEP 4: Training CNN Classifier")
 print("="*60)
 
-CSV_PATH = OUT_DIR / "cropped_card_labels_parsed.csv"
-df = pd.read_csv(CSV_PATH)
+df = pd.read_csv(OUT_DIR / "cropped_card_labels_parsed.csv")
+maps = {
+    "number": {"One":0,"Two":1,"Three":2},
+    "fill": {"Open":0,"Shaded":1,"Solid":2},
+    "color": {"Green":0,"Purple":1,"Red":2},
+    "shape": {"Diamond":0,"Oval":1,"Squiggle":2}
+}
+for key in ["number","fill","color","shape"]:
+    df[f"y_{key}"] = df[key].map(maps[key])
 
-# Mappings
-number_map = {"One": 0, "Two": 1, "Three": 2}
-fill_map = {"Open": 0, "Shaded": 1, "Solid": 2}
-color_map = {"Green": 0, "Purple": 1, "Red": 2}
-shape_map = {"Diamond": 0, "Oval": 1, "Squiggle": 2}
-
-df["y_number"] = df["number"].map(number_map)
-df["y_fill"] = df["fill"].map(fill_map)
-df["y_color"] = df["color"].map(color_map)
-df["y_shape"] = df["shape"].map(shape_map)
-
-# Load images
-input_dim = 224
-X = []
-y_num, y_fill, y_color, y_shape = [], [], [], []
-
+X, y_num, y_fill, y_color, y_shape = [], [], [], [], []
 print("Loading images...")
 for idx, row in tqdm(df.iterrows(), total=len(df), desc="Loading images"):
     img_path = CROP_DIR / row["filename"]
-    img = load_img(img_path, target_size=(input_dim, input_dim))
+    img = load_img(img_path, target_size=(224,224))
     arr = img_to_array(img)
     X.append(arr)
-
     y_num.append(row["y_number"])
     y_fill.append(row["y_fill"])
     y_color.append(row["y_color"])
@@ -238,1085 +258,303 @@ y_fill = np.array(y_fill)
 y_color = np.array(y_color)
 y_shape = np.array(y_shape)
 
-# Train/val split
 X_train, X_val, yn_train, yn_val, yf_train, yf_val, yc_train, yc_val, ys_train, ys_val = \
-    train_test_split(X, y_num, y_fill, y_color, y_shape, test_size=0.20, random_state=42)
+    train_test_split(X, y_num, y_fill, y_color, y_shape, test_size=0.2, random_state=42)
 
-# Build model
-inputs = Input(shape=(input_dim, input_dim, 3))
+inputs = Input(shape=(224,224,3))
 x = Rescaling(1/255)(inputs)
-
-x = Conv2D(32, 3, activation='relu', padding='same')(x)
+x = Conv2D(32,3,activation='relu',padding='same')(x)
 x = MaxPool2D()(x)
-x = Conv2D(64, 3, activation='relu', padding='same')(x)
+x = Conv2D(64,3,activation='relu',padding='same')(x)
 x = MaxPool2D()(x)
-x = Conv2D(128, 3, activation='relu', padding='same')(x)
+x = Conv2D(128,3,activation='relu',padding='same')(x)
 x = MaxPool2D()(x)
-
 x = Flatten()(x)
-x = Dense(256, activation='relu')(x)
+x = Dense(256,activation='relu')(x)
+out_num = Dense(3,activation='softmax',name="number")(x)
+out_fill = Dense(3,activation='softmax',name="fill")(x)
+out_color = Dense(3,activation='softmax',name="color")(x)
+out_shape = Dense(3,activation='softmax',name="shape")(x)
 
-out_num = Dense(3, activation='softmax', name="number")(x)
-out_fill = Dense(3, activation='softmax', name="fill")(x)
-out_color = Dense(3, activation='softmax', name="color")(x)
-out_shape = Dense(3, activation='softmax', name="shape")(x)
-
-model = Model(inputs, [out_num, out_fill, out_color, out_shape])
-
-model.compile(
+cnn_model = Model(inputs, [out_num, out_fill, out_color, out_shape])
+cnn_model.compile(
     optimizer="adam",
     loss="sparse_categorical_crossentropy",
-    metrics={"number": "accuracy", "fill": "accuracy", "color": "accuracy", "shape": "accuracy"}
+    metrics={"number":"accuracy","fill":"accuracy","color":"accuracy","shape":"accuracy"}
 )
 
-# Train
 save_path = OUT_DIR / "set_cnn_model.keras"
-callbacks = [
-    EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True),
-    ModelCheckpoint(save_path, save_best_only=True)
-]
-
-history = model.fit(
-    X_train,
-    [yn_train, yf_train, yc_train, ys_train],
-    validation_data=(X_val, [yn_val, yf_val, yc_val, ys_val]),
-    epochs=25,
-    batch_size=32,
-    callbacks=callbacks,
-    verbose=1
+callbacks = [EarlyStopping(monitor="val_loss",patience=6,restore_best_weights=True),
+             ModelCheckpoint(save_path,save_best_only=True)]
+cnn_model.fit(
+    X_train,[yn_train,yf_train,yc_train,ys_train],
+    validation_data=(X_val,[yn_val,yf_val,yc_val,ys_val]),
+    epochs=25,batch_size=32,callbacks=callbacks,verbose=1
 )
-
-print("✓ Model trained and saved")
-
-# ================================
-# STEP 5: TEST ON RANDOM BOARD
-# ================================
-print("\n" + "="*60)
-print("STEP 5: Testing on Random Board")
-print("="*60)
-
-MODEL_PATH = OUT_DIR / "set_cnn_model.keras"
-model = load_model(MODEL_PATH)
-
-# Label decoding
-num_map = {0: 'One', 1: 'Two', 2: 'Three'}
-fill_map = {0: 'Open', 1: 'Shaded', 2: 'Solid'}
-color_map = {0: 'Green', 1: 'Purple', 2: 'Red'}
-shape_map = {0: 'Diamond', 1: 'Oval', 2: 'Squiggle'}
-
-def classify_card(img):
-    resized = cv2.resize(img, (224, 224))
-    arr = img_to_array(resized)
-    arr = np.expand_dims(arr, axis=0)
-
-    pn, pf, pc, ps = model.predict(arr, verbose=0)
-
-    return {
-        "Number": num_map[np.argmax(pn)],
-        "Fill": fill_map[np.argmax(pf)],
-        "Color": color_map[np.argmax(pc)],
-        "Shape": shape_map[np.argmax(ps)]
-    }
-
-def test_random_board(split="train"):
-    imgs = list((IMG_DIR / split).glob("*.jpg"))
-    img_path = random.choice(imgs)
-
-    full = cv2.imread(str(img_path))
-    full_rgb = cv2.cvtColor(full, cv2.COLOR_BGR2RGB)
-
-    print(f"Testing board: {img_path.name}")
-
-    classified_cards = {}
-    crops = {}
-
-    for r in range(GRID_ROWS):
-        for c in range(GRID_COLS):
-            x1 = PADDING_X + c * (CARD_W + PADDING_X)
-            y1 = PADDING_Y + r * (CARD_H + PADDING_Y)
-            x2 = x1 + CARD_W
-            y2 = y1 + CARD_H
-
-            crop = full_rgb[y1:y2, x1:x2]
-            card_key = f"Card{r+1}{c+1}"
-
-            classified_cards[card_key] = classify_card(crop)
-            crops[card_key] = crop
-
-    return classified_cards, crops, full_rgb, img_path.name
-
-result, crops, full_board, board_name = test_random_board("train")
-
-print("\n🔎 CLASSIFIED CARDS:\n")
-for k, v in result.items():
-    print(f"{k}: {v}")
+print("✓ CNN trained and saved")
 
 # ================================
-# STEP 6: FIND ALL SETS
+# STEP 5: TRAIN YOLO
 # ================================
 print("\n" + "="*60)
-print("STEP 6: Finding SETs")
+print("STEP 5: Training YOLO Detector")
 print("="*60)
 
-encode_num = {"One": 0, "Two": 1, "Three": 2}
-encode_fill = {"Open": 0, "Shaded": 1, "Solid": 2}
-encode_color = {"Green": 0, "Purple": 1, "Red": 2}
-encode_shape = {"Diamond": 0, "Oval": 1, "Squiggle": 2}
-
-def encode_card(card):
-    return (
-        encode_num[card["Number"]],
-        encode_fill[card["Fill"]],
-        encode_color[card["Color"]],
-        encode_shape[card["Shape"]]
-    )
-
-def is_set(c1, c2, c3):
-    return all((c1[i] + c2[i] + c3[i]) % 3 == 0 for i in range(4))
-
-def find_sets(card_dict):
-    encoded = {k: encode_card(v) for k, v in card_dict.items()}
-    keys = list(encoded.keys())
-    sets_found = []
-
-    for a, b, c in combinations(keys, 3):
-        if is_set(encoded[a], encoded[b], encoded[c]):
-            sets_found.append((a, b, c))
-    return sets_found
-
-solution_sets = find_sets(result)
-
-print(f"\n🎉 SETS FOUND on {board_name}:")
-if len(solution_sets) == 0:
-    print("🚫 No sets on this board.")
-else:
-    for s in solution_sets:
-        print(f"✔️ SET: {s}")
-        a, b, c = s
-        print(f"   {a}: {result[a]}")
-        print(f"   {b}: {result[b]}")
-        print(f"   {c}: {result[c]}")
-        print()
-
-print("\n" + "="*60)
-print("PIPELINE COMPLETE!")
-print("="*60)
-print(f"✓ Generated {N_IMAGES} synthetic boards")
-print(f"✓ Created YOLO labels for object detection")
-print(f"✓ Cropped {len(crop_filenames)} individual cards")
-print(f"✓ Trained CNN for card classification")
-print(f"✓ Found {len(solution_sets)} SET(s) on test board")
-
-# ================================
-# STEP 7: VISUALIZE RESULTS
-# ================================
-print("\n" + "="*60)
-print("STEP 7: Creating Visualizations")
-print("="*60)
-
-def card_to_position(card_key):
-    """Convert Card23 -> (row=2, col=3) -> actual pixel coordinates"""
-    r = int(card_key[4]) - 1  # Card21 -> row 2 -> index 1
-    c = int(card_key[5]) - 1  # Card21 -> col 1 -> index 0
-
-    x1 = PADDING_X + c * (CARD_W + PADDING_X)
-    y1 = PADDING_Y + r * (CARD_H + PADDING_Y)
-    x2 = x1 + CARD_W
-    y2 = y1 + CARD_H
-
-    return (x1, y1, x2, y2)
-
-# Visualization 1: Random Test Board (plain)
-plt.figure(figsize=(14, 10))
-plt.imshow(full_board)
-plt.axis('off')
-plt.title(f"Random Test Board — {board_name}", fontsize=16, pad=20)
-plt.tight_layout()
-plt.savefig(OUT_DIR / "viz_1_test_board.png", dpi=150, bbox_inches='tight')
-plt.show()
-
-# Visualization 2: Cropped Cards + Positions
-fig, axes = plt.subplots(3, 4, figsize=(12, 9))
-fig.suptitle("Cropped Cards + Positions", fontsize=16, fontweight='bold')
-
-for idx, (card_key, crop) in enumerate(crops.items()):
-    r, c = divmod(idx, 4)
-    axes[r, c].imshow(crop)
-    axes[r, c].axis('off')
-    axes[r, c].set_title(card_key, fontsize=11, fontweight='bold')
-
-plt.tight_layout()
-plt.savefig(OUT_DIR / "viz_2_cropped_cards.png", dpi=150, bbox_inches='tight')
-plt.show()
-
-# Visualization 3: Identified Sets with Colored Boxes
-fig, ax = plt.subplots(figsize=(14, 10))
-ax.imshow(full_board)
-ax.axis('off')
-
-# Define colors for each SET
-colors = ['#00FF00', '#FF0000', '#00FFFF', '#FFFF00', '#FF00FF', '#FFA500']
-
-if len(solution_sets) > 0:
-    for set_idx, set_cards in enumerate(solution_sets):
-        color = colors[set_idx % len(colors)]
-
-        for card_key in set_cards:
-            x1, y1, x2, y2 = card_to_position(card_key)
-
-            # Draw thick rectangle around card
-            rect = plt.Rectangle(
-                (x1, y1),
-                x2 - x1,
-                y2 - y1,
-                linewidth=8,
-                edgecolor=color,
-                facecolor='none'
-            )
-            ax.add_patch(rect)
-
-ax.set_title(f"Identified Sets: {len(solution_sets)}", fontsize=18, fontweight='bold', pad=20)
-plt.tight_layout()
-plt.savefig(OUT_DIR / "viz_3_identified_sets.png", dpi=150, bbox_inches='tight')
-plt.show()
-
-print("\n✓ Visualizations saved:")
-print(f"  - {OUT_DIR / 'viz_1_test_board.png'}")
-print(f"  - {OUT_DIR / 'viz_2_cropped_cards.png'}")
-print(f"  - {OUT_DIR / 'viz_3_identified_sets.png'}")
-
-
-"""
-Complete YOLOv8 Training Pipeline for SET Card Detection
-Trains a detector to find cards at any position/angle, then classifies them
-"""
-
-import os
-from pathlib import Path
-import yaml
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-from tensorflow.keras.models import load_model
-from tensorflow.keras.utils import img_to_array
-from itertools import combinations
-
-# ================================
-# STEP 1: INSTALL YOLO
-# ================================
-print("="*70)
-print("STEP 1: Installing YOLOv8")
-print("="*70)
-
-# Run this in your notebook first:
-# !pip install ultralytics -q
-
-# ================================
-# STEP 2: CREATE YOLO DATASET CONFIG
-# ================================
-print("\n" + "="*70)
-print("STEP 2: Creating YOLO Dataset Configuration")
-print("="*70)
-
-OUT_DIR = Path("/content/SET_synth_clean")
-
-# Create dataset.yaml for YOLO
 dataset_config = {
     'path': str(OUT_DIR.absolute()),
     'train': 'images/train',
     'val': 'images/val',
-    'nc': 1,  # Number of classes (just "card")
-    'names': ['card']
+    'nc':1,'names':['card']
 }
+with open(OUT_DIR / "dataset.yaml",'w') as f:
+    yaml.dump(dataset_config,f)
 
-config_path = OUT_DIR / "dataset.yaml"
-with open(config_path, 'w') as f:
-    yaml.dump(dataset_config, f)
-
-print(f"✓ Dataset config created at: {config_path}")
-print(f"  - Training images: {len(list((OUT_DIR / 'images/train').glob('*.jpg')))}")
-print(f"  - Validation images: {len(list((OUT_DIR / 'images/val').glob('*.jpg')))}")
-print(f"  - Training labels: {len(list((OUT_DIR / 'labels/train').glob('*.txt')))}")
-print(f"  - Validation labels: {len(list((OUT_DIR / 'labels/val').glob('*.txt')))}")
-
-# ================================
-# STEP 3: TRAIN YOLO MODEL
-# ================================
-print("\n" + "="*70)
-print("STEP 3: Training YOLO Model")
-print("="*70)
-
-from ultralytics import YOLO
-
-# Initialize YOLOv8 nano (fastest, good for 200 images)
-model = YOLO('yolov8n.pt')
-
-# Train the model
-# Automatically detect device (CPU or GPU)
-import torch
+yolo_model = YOLO('yolov8n.pt')
 device = 'cpu' if not torch.cuda.is_available() else 0
-
 print(f"Training on: {'CPU' if device == 'cpu' else 'GPU'}")
-if device == 'cpu':
-    print("⚠️  Training on CPU will be slower. Consider using Google Colab with GPU runtime.")
 
-results = model.train(
-    data=str(config_path),
+yolo_model.train(
+    data=str(OUT_DIR / "dataset.yaml"),
     epochs=50,
     imgsz=640,
-    batch=8 if device == 'cpu' else 16,  # Smaller batch for CPU
+    batch=8 if device=='cpu' else 16,
     name='set_card_detector',
     patience=10,
     save=True,
     plots=True,
     device=device
 )
-
-print("\n✓ YOLO training complete!")
-print(f"  - Best model saved at: runs/detect/set_card_detector/weights/best.pt")
+print("✓ YOLO trained")
 
 # ================================
-# STEP 4: LOAD MODELS
+# STEP 6: INFERENCE PIPELINE
 # ================================
-print("\n" + "="*70)
-print("STEP 4: Loading Models")
-print("="*70)
+print("\n" + "="*60)
+print("STEP 6: Setting Up Inference Pipeline")
+print("="*60)
 
-# Load trained YOLO detector
-yolo_model = YOLO('runs/detect/set_card_detector/weights/best.pt')
-print("✓ YOLO model loaded")
+num_map = {0:'One',1:'Two',2:'Three'}
+fill_map = {0:'Open',1:'Shaded',2:'Solid'}
+color_map = {0:'Green',1:'Purple',2:'Red'}
+shape_map = {0:'Diamond',1:'Oval',2:'Squiggle'}
 
-# Load CNN classifier
-cnn_model = load_model(OUT_DIR / "set_cnn_model.keras")
-print("✓ CNN classifier loaded")
-
-# ================================
-# STEP 5: INFERENCE PIPELINE
-# ================================
-print("\n" + "="*70)
-print("STEP 5: Creating Inference Pipeline")
-print("="*70)
-
-# Label mappings
-num_map = {0: 'One', 1: 'Two', 2: 'Three'}
-fill_map = {0: 'Open', 1: 'Shaded', 2: 'Solid'}
-color_map = {0: 'Green', 1: 'Purple', 2: 'Red'}
-shape_map = {0: 'Diamond', 1: 'Oval', 2: 'Squiggle'}
-
-encode_num = {"One": 0, "Two": 1, "Three": 2}
-encode_fill = {"Open": 0, "Shaded": 1, "Solid": 2}
-encode_color = {"Green": 0, "Purple": 1, "Red": 2}
-encode_shape = {"Diamond": 0, "Oval": 1, "Squiggle": 2}
+encode_num = {"One":0,"Two":1,"Three":2}
+encode_fill = {"Open":0,"Shaded":1,"Solid":2}
+encode_color = {"Green":0,"Purple":1,"Red":2}
+encode_shape = {"Diamond":0,"Oval":1,"Squiggle":2}
 
 def classify_card(img):
-    """Classify a single card image using CNN"""
-    if len(img.shape) == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-
-    resized = cv2.resize(img, (224, 224))
-    arr = img_to_array(resized)
-    arr = np.expand_dims(arr, axis=0)
-
-    pn, pf, pc, ps = cnn_model.predict(arr, verbose=0)
-
+    """Classify a single card using CNN"""
+    if len(img.shape)==2:
+        img=cv2.cvtColor(img,cv2.COLOR_GRAY2RGB)
+    arr = np.expand_dims(img_to_array(cv2.resize(img,(224,224))),axis=0)
+    pn,pf,pc,ps = cnn_model.predict(arr,verbose=0)
     return {
-        "Number": num_map[np.argmax(pn)],
-        "Fill": fill_map[np.argmax(pf)],
-        "Color": color_map[np.argmax(pc)],
-        "Shape": shape_map[np.argmax(ps)],
-        "Confidence": {
-            "Number": float(np.max(pn)),
-            "Fill": float(np.max(pf)),
-            "Color": float(np.max(pc)),
-            "Shape": float(np.max(ps))
+        "Number":num_map[np.argmax(pn)],
+        "Fill":fill_map[np.argmax(pf)],
+        "Color":color_map[np.argmax(pc)],
+        "Shape":shape_map[np.argmax(ps)],
+        "Confidence":{
+            "Number":float(np.max(pn)),
+            "Fill":float(np.max(pf)),
+            "Color":float(np.max(pc)),
+            "Shape":float(np.max(ps))
         }
     }
 
 def encode_card(card):
-    return (
-        encode_num[card["Number"]],
-        encode_fill[card["Fill"]],
-        encode_color[card["Color"]],
-        encode_shape[card["Shape"]]
-    )
+    """Encode card attributes as tuple for SET validation"""
+    return (encode_num[card["Number"]], encode_fill[card["Fill"]],
+            encode_color[card["Color"]], encode_shape[card["Shape"]])
 
-def is_set(c1, c2, c3):
-    return all((c1[i] + c2[i] + c3[i]) % 3 == 0 for i in range(4))
+def is_set(c1,c2,c3):
+    """Check if three cards form a valid SET"""
+    return all((c1[i]+c2[i]+c3[i])%3==0 for i in range(4))
 
 def find_sets(card_dict):
-    encoded = {k: encode_card(v) for k, v in card_dict.items()}
-    keys = list(encoded.keys())
-    sets_found = []
-
-    for a, b, c in combinations(keys, 3):
+    """Find all valid SETs in a collection of cards"""
+    encoded={k:encode_card(v) for k,v in card_dict.items()}
+    keys=list(encoded.keys())
+    sets_found=[]
+    for a,b,c in combinations(keys,3):
         # Skip duplicate cards
-        if encoded[a] == encoded[b] or encoded[b] == encoded[c] or encoded[a] == encoded[c]:
+        if encoded[a]==encoded[b] or encoded[b]==encoded[c] or encoded[a]==encoded[c]:
             continue
-
-        if is_set(encoded[a], encoded[b], encoded[c]):
-            sets_found.append((a, b, c))
-
+        if is_set(encoded[a],encoded[b],encoded[c]):
+            sets_found.append((a,b,c))
     return sets_found
 
-def detect_and_classify(image_path, conf_threshold=0.25):
-    """
-    Complete pipeline: Detect cards with YOLO, classify with CNN, find SETs
-
-    Parameters:
-    -----------
-    image_path : str or Path
-        Path to image with SET cards
-    conf_threshold : float
-        YOLO confidence threshold (0-1)
-
-    Returns:
-    --------
-    dict : Detection and classification results
-    """
-
+def detect_and_classify(image_path, conf_threshold=0.25, max_cards=12):
+    """Complete pipeline: YOLO detection → CNN classification → SET finding"""
     print(f"\n{'='*70}")
     print(f"Processing: {Path(image_path).name}")
     print('='*70)
 
-    # Load image
-    img = cv2.imread(str(image_path))
+    img=cv2.imread(str(image_path))
     if img is None:
         raise ValueError(f"Could not load image: {image_path}")
 
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
 
-    # Step 1: Detect cards with YOLO
+    # Step 1: Detect cards
     print("\n🔍 Step 1: Detecting cards with YOLO...")
-    results = yolo_model.predict(
-        source=img_rgb,
-        conf=conf_threshold,
-        verbose=False
-    )[0]
+    results=yolo_model.predict(source=img,conf=conf_threshold,verbose=False)[0]
+    boxes=results.boxes
 
-    boxes = results.boxes
-    num_detections = len(boxes)
-    print(f"✓ Detected {num_detections} cards")
+    # Filter to max_cards by confidence if we detect more
+    if len(boxes) > max_cards:
+        print(f"⚠️  Detected {len(boxes)} cards, filtering to top {max_cards} by confidence...")
+        # Sort by confidence and keep top max_cards
+        confidences = [float(box.conf[0]) for box in boxes]
+        sorted_indices = sorted(range(len(confidences)), key=lambda i: confidences[i], reverse=True)
+        boxes = [boxes[i] for i in sorted_indices[:max_cards]]
 
-    if num_detections == 0:
+    print(f"✓ Using {len(boxes)} cards")
+
+    if len(boxes)==0:
         print("⚠️  No cards detected!")
         return None
 
-    # Step 2: Classify each detected card
+    # Step 2: Classify cards
     print("\n🧠 Step 2: Classifying detected cards...")
-    classified_cards = {}
-    card_boxes = {}
+    classified_cards={}
+    card_boxes={}
 
-    for idx, box in enumerate(boxes):
-        # Get bounding box coordinates
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        confidence = float(box.conf[0])
+    for idx,box in enumerate(boxes):
+        x1,y1,x2,y2=map(int,box.xyxy[0])
+        conf=float(box.conf[0])
+        crop=img[y1:y2,x1:x2]
+        if crop.size==0: continue
 
-        # Crop card
-        card_crop = img_rgb[y1:y2, x1:x2]
+        card_key=f"Card{idx+1}"
+        classified_cards[card_key]=classify_card(crop)
+        card_boxes[card_key]=(x1,y1,x2,y2,conf)
 
-        if card_crop.size == 0:
-            continue
-
-        # Classify card
-        card_key = f"Card{idx+1}"
-        classification = classify_card(card_crop)
-
-        classified_cards[card_key] = classification
-        card_boxes[card_key] = (x1, y1, x2, y2, confidence)
-
-        avg_conf = np.mean(list(classification["Confidence"].values()))
-        print(f"  {card_key}: {classification['Number']:6} {classification['Fill']:7} "
-              f"{classification['Color']:6} {classification['Shape']:8} "
-              f"(YOLO: {confidence:.2%}, CNN: {avg_conf:.2%})")
+        card=classified_cards[card_key]
+        avg_conf=np.mean(list(card["Confidence"].values()))
+        print(f"  {card_key}: {card['Number']:6} {card['Fill']:7} "
+              f"{card['Color']:6} {card['Shape']:8} "
+              f"(YOLO: {conf:.2%}, CNN: {avg_conf:.2%})")
 
     # Step 3: Find SETs
     print("\n🎯 Step 3: Finding SETs...")
-    solution_sets = find_sets(classified_cards)
+    sets=find_sets(classified_cards)
 
-    if len(solution_sets) == 0:
+    if len(sets)==0:
         print("🚫 No SETs found")
     else:
-        print(f"🎉 Found {len(solution_sets)} SET(s):")
-        for idx, (a, b, c) in enumerate(solution_sets, 1):
+        print(f"🎉 Found {len(sets)} SET(s):")
+        for idx,(a,b,c) in enumerate(sets,1):
             print(f"\nSET #{idx}: {a}, {b}, {c}")
-            for card_key in [a, b, c]:
-                card = classified_cards[card_key]
-                print(f"  {card_key}: {card['Number']:6} {card['Fill']:7} "
+            for k in [a,b,c]:
+                card=classified_cards[k]
+                print(f"  {k}: {card['Number']:6} {card['Fill']:7} "
                       f"{card['Color']:6} {card['Shape']:8}")
 
-    return {
-        'image': img_rgb,
-        'classified_cards': classified_cards,
-        'card_boxes': card_boxes,
-        'sets': solution_sets
-    }
-
-# ================================
-# STEP 6: VISUALIZATION
-# ================================
+    return {'image':img,'classified_cards':classified_cards,'card_boxes':card_boxes,'sets':sets}
 
 def visualize_results(results, save_path=None):
-    """
-    Visualize detection and classification results
-    """
-
+    """Visualize detection results and found SETs"""
     if results is None:
         print("No results to visualize")
         return
 
-    img = results['image']
-    card_boxes = results['card_boxes']
-    classified_cards = results['classified_cards']
-    sets = results['sets']
+    img=results['image']
+    boxes=results['card_boxes']
+    cards=results['classified_cards']
+    sets=results['sets']
 
-    # Create figure with 2 subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+    fig, (ax1,ax2)=plt.subplots(1,2,figsize=(20,10))
 
     # Left: All detected cards with labels
     ax1.imshow(img)
     ax1.axis('off')
-    ax1.set_title('Detected & Classified Cards', fontsize=16, fontweight='bold')
+    ax1.set_title('Detected & Classified Cards',fontsize=16,fontweight='bold')
 
-    for card_key, (x1, y1, x2, y2, conf) in card_boxes.items():
-        # Draw box
-        rect = plt.Rectangle(
-            (x1, y1), x2 - x1, y2 - y1,
-            linewidth=3, edgecolor='lime', facecolor='none'
-        )
-        ax1.add_patch(rect)
-
-        # Add label
-        card = classified_cards[card_key]
-        label = f"{card_key}\n{card['Number']} {card['Fill']}\n{card['Color']} {card['Shape']}"
-        ax1.text(
-            x1, y1 - 10,
-            label,
-            color='white',
-            fontsize=9,
-            fontweight='bold',
-            bbox=dict(boxstyle='round', facecolor='lime', alpha=0.8)
-        )
+    for k,(x1,y1,x2,y2,conf) in boxes.items():
+        ax1.add_patch(plt.Rectangle((x1,y1),x2-x1,y2-y1,linewidth=3,edgecolor='lime',facecolor='none'))
+        card=cards[k]
+        label=f"{k}\n{card['Number']} {card['Fill']}\n{card['Color']} {card['Shape']}"
+        ax1.text(x1,y1-10,label,color='white',fontsize=9,fontweight='bold',
+                bbox=dict(boxstyle='round',facecolor='lime',alpha=0.8))
 
     # Right: SETs highlighted
     ax2.imshow(img)
     ax2.axis('off')
 
-    if len(sets) > 0:
-        ax2.set_title(f'Found {len(sets)} SET(s)', fontsize=16, fontweight='bold')
-
-        colors = ['#00FF00', '#FF0000', '#00FFFF', '#FFFF00', '#FF00FF', '#FFA500']
-
-        for set_idx, (a, b, c) in enumerate(sets):
-            color = colors[set_idx % len(colors)]
-
-            for card_key in [a, b, c]:
-                if card_key in card_boxes:
-                    x1, y1, x2, y2, _ = card_boxes[card_key]
-
-                    rect = plt.Rectangle(
-                        (x1, y1), x2 - x1, y2 - y1,
-                        linewidth=6, edgecolor=color, facecolor='none'
-                    )
-                    ax2.add_patch(rect)
-
-                    # Add SET number
-                    ax2.text(
-                        x1 + 10, y1 + 30,
-                        f"SET {set_idx + 1}",
-                        color='white',
-                        fontsize=12,
-                        fontweight='bold',
-                        bbox=dict(boxstyle='round', facecolor=color, alpha=0.8)
-                    )
-    else:
-        ax2.set_title('No SETs Found', fontsize=16, fontweight='bold')
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"✓ Visualization saved to: {save_path}")
-
-    plt.show()
-
-# ================================
-# STEP 7: TEST ON NEW IMAGE
-# ================================
-
-def test_full_pipeline(image_path):
-    """
-    Run complete pipeline on a test image
-    """
-    results = detect_and_classify(image_path, conf_threshold=0.25)
-
-    if results:
-        visualize_results(results, save_path=OUT_DIR / "yolo_results.png")
-
-    return results
-
-# ================================
-# USAGE EXAMPLE
-# ================================
-
-if __name__ == "__main__":
-
-    print("\n" + "="*70)
-    print("TESTING YOLO PIPELINE")
-    print("="*70)
-
-    # Test on your image
-    results = test_full_pipeline("/content/Test Cropped.jpg")
-
-    # Test on validation images
-    print("\n" + "="*70)
-    print("Testing on validation set samples...")
-    print("="*70)
-
-    val_images = list((OUT_DIR / "images/val").glob("*.jpg"))
-    if val_images:
-        for img_path in val_images[:3]:  # Test first 3
-            results = test_full_pipeline(img_path)
-            print("\n" + "-"*70 + "\n")
-
-print("\n" + "="*70)
-print("YOLO TRAINING PIPELINE COMPLETE!")
-print("="*70)
-print("\nYou can now detect and classify cards in ANY image:")
-print("  results = test_full_pipeline('/path/to/your/image.jpg')")
-print("\nThe pipeline will:")
-print("  1. Detect all cards with YOLO (any position/angle)")
-print("  2. Classify each card with CNN")
-print("  3. Find all valid SETs")
-print("  4. Visualize results")
-print("="*70)
-
-"""
-Complete YOLOv8 Training Pipeline for SET Card Detection
-Trains a detector to find cards at any position/angle, then classifies them
-"""
-
-import os
-from pathlib import Path
-import yaml
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-from tensorflow.keras.models import load_model
-from tensorflow.keras.utils import img_to_array
-from itertools import combinations
-
-# ================================
-# STEP 1: INSTALL YOLO
-# ================================
-print("="*70)
-print("STEP 1: Installing YOLOv8")
-print("="*70)
-
-# Run this in your notebook first:
-# !pip install ultralytics -q
-
-# ================================
-# STEP 2: CREATE YOLO DATASET CONFIG
-# ================================
-print("\n" + "="*70)
-print("STEP 2: Creating YOLO Dataset Configuration")
-print("="*70)
-
-OUT_DIR = Path("/content/SET_synth_clean")
-
-# Create dataset.yaml for YOLO
-dataset_config = {
-    'path': str(OUT_DIR.absolute()),
-    'train': 'images/train',
-    'val': 'images/val',
-    'nc': 1,  # Number of classes (just "card")
-    'names': ['card']
-}
-
-config_path = OUT_DIR / "dataset.yaml"
-with open(config_path, 'w') as f:
-    yaml.dump(dataset_config, f)
-
-print(f"✓ Dataset config created at: {config_path}")
-print(f"  - Training images: {len(list((OUT_DIR / 'images/train').glob('*.jpg')))}")
-print(f"  - Validation images: {len(list((OUT_DIR / 'images/val').glob('*.jpg')))}")
-print(f"  - Training labels: {len(list((OUT_DIR / 'labels/train').glob('*.txt')))}")
-print(f"  - Validation labels: {len(list((OUT_DIR / 'labels/val').glob('*.txt')))}")
-
-# ================================
-# STEP 3: TRAIN YOLO MODEL
-# ================================
-print("\n" + "="*70)
-print("STEP 3: Training YOLO Model")
-print("="*70)
-
-from ultralytics import YOLO
-
-# Initialize YOLOv8 nano (fastest, good for 200 images)
-model = YOLO('yolov8n.pt')
-
-# Train the model
-# Automatically detect device (CPU or GPU)
-import torch
-device = 'cpu' if not torch.cuda.is_available() else 0
-
-print(f"Training on: {'CPU' if device == 'cpu' else 'GPU'}")
-if device == 'cpu':
-    print("⚠️  Training on CPU will be slower. Consider using Google Colab with GPU runtime.")
-
-results = model.train(
-    data=str(config_path),
-    epochs=50,
-    imgsz=640,
-    batch=8 if device == 'cpu' else 16,  # Smaller batch for CPU
-    name='set_card_detector',
-    patience=10,
-    save=True,
-    plots=True,
-    device=device
-)
-
-print("\n✓ YOLO training complete!")
-print(f"  - Best model saved at: runs/detect/set_card_detector/weights/best.pt")
-
-# ================================
-# STEP 4: LOAD MODELS
-# ================================
-print("\n" + "="*70)
-print("STEP 4: Loading Models")
-print("="*70)
-
-# Load trained YOLO detector
-yolo_model = YOLO('runs/detect/set_card_detector/weights/best.pt')
-print("✓ YOLO model loaded")
-
-# Load CNN classifier
-cnn_model = load_model(OUT_DIR / "set_cnn_model.keras")
-print("✓ CNN classifier loaded")
-
-# ================================
-# STEP 5: INFERENCE PIPELINE
-# ================================
-print("\n" + "="*70)
-print("STEP 5: Creating Inference Pipeline")
-print("="*70)
-
-# Label mappings
-num_map = {0: 'One', 1: 'Two', 2: 'Three'}
-fill_map = {0: 'Open', 1: 'Shaded', 2: 'Solid'}
-color_map = {0: 'Green', 1: 'Purple', 2: 'Red'}
-shape_map = {0: 'Diamond', 1: 'Oval', 2: 'Squiggle'}
-
-encode_num = {"One": 0, "Two": 1, "Three": 2}
-encode_fill = {"Open": 0, "Shaded": 1, "Solid": 2}
-encode_color = {"Green": 0, "Purple": 1, "Red": 2}
-encode_shape = {"Diamond": 0, "Oval": 1, "Squiggle": 2}
-
-def classify_card(img):
-    """Classify a single card image using CNN"""
-    if len(img.shape) == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-
-    resized = cv2.resize(img, (224, 224))
-    arr = img_to_array(resized)
-    arr = np.expand_dims(arr, axis=0)
-
-    pn, pf, pc, ps = cnn_model.predict(arr, verbose=0)
-
-    return {
-        "Number": num_map[np.argmax(pn)],
-        "Fill": fill_map[np.argmax(pf)],
-        "Color": color_map[np.argmax(pc)],
-        "Shape": shape_map[np.argmax(ps)],
-        "Confidence": {
-            "Number": float(np.max(pn)),
-            "Fill": float(np.max(pf)),
-            "Color": float(np.max(pc)),
-            "Shape": float(np.max(ps))
-        }
-    }
-
-def encode_card(card):
-    return (
-        encode_num[card["Number"]],
-        encode_fill[card["Fill"]],
-        encode_color[card["Color"]],
-        encode_shape[card["Shape"]]
-    )
-
-def is_set(c1, c2, c3):
-    return all((c1[i] + c2[i] + c3[i]) % 3 == 0 for i in range(4))
-
-def find_sets(card_dict):
-    encoded = {k: encode_card(v) for k, v in card_dict.items()}
-    keys = list(encoded.keys())
-    sets_found = []
-
-    for a, b, c in combinations(keys, 3):
-        # Skip duplicate cards
-        if encoded[a] == encoded[b] or encoded[b] == encoded[c] or encoded[a] == encoded[c]:
-            continue
-
-        if is_set(encoded[a], encoded[b], encoded[c]):
-            sets_found.append((a, b, c))
-
-    return sets_found
-
-def detect_and_classify(image_path, conf_threshold=0.25):
-    """
-    Complete pipeline: Detect cards with YOLO, classify with CNN, find SETs
-
-    Parameters:
-    -----------
-    image_path : str or Path
-        Path to image with SET cards
-    conf_threshold : float
-        YOLO confidence threshold (0-1)
-
-    Returns:
-    --------
-    dict : Detection and classification results
-    """
-
-    print(f"\n{'='*70}")
-    print(f"Processing: {Path(image_path).name}")
-    print('='*70)
-
-    # Load image
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise ValueError(f"Could not load image: {image_path}")
-
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # Step 1: Detect cards with YOLO
-    print("\n🔍 Step 1: Detecting cards with YOLO...")
-    results = yolo_model.predict(
-        source=img_rgb,
-        conf=conf_threshold,
-        verbose=False
-    )[0]
-
-    boxes = results.boxes
-    num_detections = len(boxes)
-    print(f"✓ Detected {num_detections} cards")
-
-    if num_detections == 0:
-        print("⚠️  No cards detected!")
-        return None
-
-    # Step 2: Classify each detected card
-    print("\n🧠 Step 2: Classifying detected cards...")
-    classified_cards = {}
-    card_boxes = {}
-
-    for idx, box in enumerate(boxes):
-        # Get bounding box coordinates
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        confidence = float(box.conf[0])
-
-        # Crop card
-        card_crop = img_rgb[y1:y2, x1:x2]
-
-        if card_crop.size == 0:
-            continue
-
-        # Classify card
-        card_key = f"Card{idx+1}"
-        classification = classify_card(card_crop)
-
-        classified_cards[card_key] = classification
-        card_boxes[card_key] = (x1, y1, x2, y2, confidence)
-
-        avg_conf = np.mean(list(classification["Confidence"].values()))
-        print(f"  {card_key}: {classification['Number']:6} {classification['Fill']:7} "
-              f"{classification['Color']:6} {classification['Shape']:8} "
-              f"(YOLO: {confidence:.2%}, CNN: {avg_conf:.2%})")
-
-    # Step 3: Find SETs
-    print("\n🎯 Step 3: Finding SETs...")
-    solution_sets = find_sets(classified_cards)
-
-    if len(solution_sets) == 0:
-        print("🚫 No SETs found")
-    else:
-        print(f"🎉 Found {len(solution_sets)} SET(s):")
-        for idx, (a, b, c) in enumerate(solution_sets, 1):
-            print(f"\nSET #{idx}: {a}, {b}, {c}")
-            for card_key in [a, b, c]:
-                card = classified_cards[card_key]
-                print(f"  {card_key}: {card['Number']:6} {card['Fill']:7} "
-                      f"{card['Color']:6} {card['Shape']:8}")
-
-    return {
-        'image': img_rgb,
-        'classified_cards': classified_cards,
-        'card_boxes': card_boxes,
-        'sets': solution_sets
-    }
-
-# ================================
-# STEP 6: VISUALIZATION
-# ================================
-
-def visualize_results(results, save_path=None):
-    """
-    Visualize detection and classification results
-    """
-
-    if results is None:
-        print("No results to visualize")
-        return
-
-    img = results['image']
-    card_boxes = results['card_boxes']
-    classified_cards = results['classified_cards']
-    sets = results['sets']
-
-    # Create figure with 2 subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
-
-    # Left: All detected cards with labels
-    ax1.imshow(img)
-    ax1.axis('off')
-    ax1.set_title('Detected & Classified Cards', fontsize=16, fontweight='bold')
-
-    for card_key, (x1, y1, x2, y2, conf) in card_boxes.items():
-        # Draw box
-        rect = plt.Rectangle(
-            (x1, y1), x2 - x1, y2 - y1,
-            linewidth=3, edgecolor='lime', facecolor='none'
-        )
-        ax1.add_patch(rect)
-
-        # Add label
-        card = classified_cards[card_key]
-        label = f"{card_key}\n{card['Number']} {card['Fill']}\n{card['Color']} {card['Shape']}"
-        ax1.text(
-            x1, y1 - 10,
-            label,
-            color='white',
-            fontsize=9,
-            fontweight='bold',
-            bbox=dict(boxstyle='round', facecolor='lime', alpha=0.8)
-        )
-
-    # Right: SETs highlighted with overlapping boxes
-    ax2.imshow(img)
-    ax2.axis('off')
-
-    if len(sets) > 0:
-        ax2.set_title(f'Found {len(sets)} SET(s)', fontsize=16, fontweight='bold')
-
-        colors = ['#00FF00', '#FF0000', '#00FFFF', '#FFFF00', '#FF00FF', '#FFA500']
-
-        # Track which cards are in which SETs for labeling
-        card_to_sets = {}
-        for set_idx, (a, b, c) in enumerate(sets):
-            for card_key in [a, b, c]:
-                if card_key not in card_to_sets:
-                    card_to_sets[card_key] = []
-                card_to_sets[card_key].append(set_idx + 1)
-
-        # Draw all boxes with offsets for overlapping sets
-        for set_idx, (a, b, c) in enumerate(sets):
-            color = colors[set_idx % len(colors)]
-
-            for card_key in [a, b, c]:
-                if card_key in card_boxes:
-                    x1, y1, x2, y2, _ = card_boxes[card_key]
-
-                    # Calculate offset based on which SET this is for this card
-                    card_set_position = card_to_sets[card_key].index(set_idx + 1)
-                    offset = card_set_position * 8  # 8 pixels offset per additional SET
-
-                    # Draw rectangle with offset
-                    rect = plt.Rectangle(
-                        (x1 - offset, y1 - offset),
-                        (x2 - x1) + 2*offset,
-                        (y2 - y1) + 2*offset,
-                        linewidth=6,
-                        edgecolor=color,
-                        facecolor='none',
-                        linestyle='-'
-                    )
-                    ax2.add_patch(rect)
+    if len(sets)>0:
+        ax2.set_title(f'Found {len(sets)} SET(s)',fontsize=16,fontweight='bold')
+        colors=['#00FF00','#FF0000','#00FFFF','#FFFF00','#FF00FF','#FFA500']
+
+        # Track which cards are in which SETs
+        card_to_sets={}
+        for set_idx,(a,b,c) in enumerate(sets):
+            for k in [a,b,c]:
+                card_to_sets.setdefault(k,[]).append(set_idx+1)
+
+        # Draw boxes with offsets for overlapping SETs
+        for set_idx,(a,b,c) in enumerate(sets):
+            color=colors[set_idx%len(colors)]
+            for k in [a,b,c]:
+                if k in boxes:
+                    x1,y1,x2,y2,_=boxes[k]
+                    offset=card_to_sets[k].index(set_idx+1)*8
+                    ax2.add_patch(plt.Rectangle((x1-offset,y1-offset),(x2-x1)+2*offset,(y2-y1)+2*offset,
+                                                linewidth=6,edgecolor=color,facecolor='none'))
 
         # Add labels showing which SETs each card belongs to
-        for card_key, set_numbers in card_to_sets.items():
-            if card_key in card_boxes:
-                x1, y1, x2, y2, _ = card_boxes[card_key]
-
-                # Create label with all SET numbers
-                set_label = ", ".join([f"SET {n}" for n in set_numbers])
-
-                ax2.text(
-                    x1 + 10, y1 + 30,
-                    set_label,
-                    color='white',
-                    fontsize=10,
-                    fontweight='bold',
-                    bbox=dict(boxstyle='round', facecolor='black', alpha=0.7, edgecolor='white', linewidth=2)
-                )
+        for k,sns in card_to_sets.items():
+            if k in boxes:
+                x1,y1,x2,y2,_=boxes[k]
+                ax2.text(x1+10,y1+30,", ".join([f"SET {n}" for n in sns]),color='white',fontsize=10,
+                        fontweight='bold',bbox=dict(boxstyle='round',facecolor='black',alpha=0.7,
+                        edgecolor='white',linewidth=2))
     else:
-        ax2.set_title('No SETs Found', fontsize=16, fontweight='bold')
+        ax2.set_title('No SETs Found',fontsize=16,fontweight='bold')
 
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path,dpi=150,bbox_inches='tight')
         print(f"✓ Visualization saved to: {save_path}")
 
     plt.show()
 
-# ================================
-# STEP 7: TEST ON NEW IMAGE
-# ================================
-
-def test_full_pipeline(image_path):
-    """
-    Run complete pipeline on a test image
-    """
-    results = detect_and_classify(image_path, conf_threshold=0.25)
-
+def test_full_pipeline(image_path, max_cards=12):
+    """Run complete detection pipeline on an image"""
+    results=detect_and_classify(image_path, max_cards=max_cards)
     if results:
-        visualize_results(results, save_path=OUT_DIR / "yolo_results.png")
-
+        visualize_results(results,save_path=OUT_DIR/"yolo_results.png")
     return results
 
+print("✓ Inference pipeline ready")
+
 # ================================
-# USAGE EXAMPLE
+# STEP 7: RUN TESTS
 # ================================
+print("\n" + "="*70)
+print("STEP 7: Testing Complete Pipeline")
+print("="*70)
 
-if __name__ == "__main__":
+test_image = "/content/Test Cropped.jpg"
 
-    print("\n" + "="*70)
-    print("TESTING YOLO PIPELINE")
-    print("="*70)
+# Optional: Extract cards using OpenCV first (for comparison)
+print("\n--- Testing OpenCV Card Extraction ---")
+extract_cards_opencv(test_image)
 
-    # Test on your image
-    results = test_full_pipeline("/content/Test Cropped.jpg")
-
-    # Test on validation images
-    print("\n" + "="*70)
-    print("Testing on validation set samples...")
-    print("="*70)
-
-    val_images = list((OUT_DIR / "images/val").glob("*.jpg"))
-    if val_images:
-        for img_path in val_images[:3]:  # Test first 3
-            results = test_full_pipeline(img_path)
-            print("\n" + "-"*70 + "\n")
+# Run full YOLO + CNN + SET detection pipeline
+print("\n--- Testing Full Detection Pipeline ---")
+results = test_full_pipeline(test_image)
 
 print("\n" + "="*70)
-print("YOLO TRAINING PIPELINE COMPLETE!")
+print("✅ PIPELINE COMPLETE!")
 print("="*70)
-print("\nYou can now detect and classify cards in ANY image:")
-print("  results = test_full_pipeline('/path/to/your/image.jpg')")
-print("\nThe pipeline will:")
-print("  1. Detect all cards with YOLO (any position/angle)")
-print("  2. Classify each card with CNN")
-print("  3. Find all valid SETs")
-print("  4. Visualize results")
+print("\nYou can now use:")
+print("  results = test_full_pipeline('path/to/image.jpg')")
 print("="*70)
 
+# ================================
+# HOW TO TEST ON NEW IMAGES
+# ================================
+
+results = test_full_pipeline("/content/Test 2.png")
