@@ -1,0 +1,100 @@
+import cv2
+import numpy as np
+from google.colab import files
+from google.colab.patches import cv2_imshow
+import os
+from pathlib import Path
+
+def extract_cards(image_path, output_folder='extracted_cards'):
+    """
+    Extract 12 SET cards from an image and save them individually.
+    
+    Args:
+        image_path: Path to the input image
+        output_folder: Folder to save extracted cards
+    """
+    # Create output folder
+    Path(output_folder).mkdir(exist_ok=True)
+    
+    # Read image
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not read image at {image_path}")
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Apply Gaussian blur
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Threshold to get binary image
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Find contours
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Filter contours by area and aspect ratio
+    card_contours = []
+    img_area = img.shape[0] * img.shape[1]
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        # Card should be reasonably large (adjust threshold as needed)
+        if area < img_area * 0.02 or area > img_area * 0.3:
+            continue
+        
+        # Get bounding rectangle
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = float(w) / h
+        
+        # Cards should be roughly rectangular with aspect ratio close to card dimensions
+        if 0.4 < aspect_ratio < 0.9:  # Adjust based on your card orientation
+            card_contours.append((x, y, w, h, area))
+    
+    # Sort cards by position (top to bottom, left to right)
+    card_contours.sort(key=lambda c: (c[1] // 100, c[0]))  # Group by rows
+    
+    print(f"Found {len(card_contours)} cards")
+    
+    # Extract and save each card
+    for idx, (x, y, w, h, area) in enumerate(card_contours[:12]):  # Limit to 12 cards
+        # Add small margin around card
+        margin = 5
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(img.shape[1], x + w + margin)
+        y2 = min(img.shape[0], y + h + margin)
+        
+        # Extract card region
+        card = img[y1:y2, x1:x2]
+        
+        # Save card
+        output_path = os.path.join(output_folder, f'card_{idx+1:02d}.png')
+        cv2.imwrite(output_path, card)
+        print(f"Saved {output_path} - Size: {card.shape[1]}x{card.shape[0]}")
+    
+    print(f"\nExtracted {min(len(card_contours), 12)} cards to '{output_folder}/' folder")
+    
+    # Show visualization
+    vis_img = img.copy()
+    for idx, (x, y, w, h, _) in enumerate(card_contours[:12]):
+        cv2.rectangle(vis_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(vis_img, str(idx+1), (x+10, y+30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    
+    print("\nVisualization of detected cards:")
+    cv2_imshow(vis_img)
+    
+    return output_folder
+
+# Upload image
+print("Upload your image of 12 SET cards:")
+uploaded = files.upload()
+
+# Process the uploaded image
+if uploaded:
+    image_filename = list(uploaded.keys())[0]
+    output_folder = extract_cards(image_filename)
+    print(f"\nAll cards saved in '{output_folder}/' folder")
+else:
+    print("No file uploaded")
