@@ -1,0 +1,421 @@
+import cv2
+import numpy as np
+from google.colab import files
+from google.colab.patches import cv2_imshow
+import os
+from pathlib import Path
+import tensorflow as tf
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.preprocessing import image
+from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
+from IPython.display import display, Image as IPImage
+import pandas as pd
+
+print("="*60)
+print("SET CARD ANALYZER - COMPLETE PIPELINE")
+print("="*60)
+
+# ============================================================================
+# STEP 1: EXTRACT CARDS FROM IMAGE
+# ============================================================================
+
+def extract_cards(image_path, output_folder='extracted_cards'):
+    """
+    Extract 12 SET cards from an image and save them individually with position info.
+    """
+    Path(output_folder).mkdir(exist_ok=True)
+
+    # Read image
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not read image at {image_path}")
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Apply Gaussian blur
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Threshold to get binary image
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Find contours
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Filter contours by area and aspect ratio
+    card_contours = []
+    img_area = img.shape[0] * img.shape[1]
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < img_area * 0.02 or area > img_area * 0.3:
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = float(w) / h
+
+        if 0.4 < aspect_ratio < 0.9:
+            card_contours.append((x, y, w, h, area))
+
+    # Sort cards by position (top to bottom, left to right)
+    card_contours.sort(key=lambda c: (c[1] // 100, c[0]))
+
+    print(f"\n✓ Found {len(card_contours)} cards")
+
+    # Clear the output folder first to avoid duplicates
+    for old_file in Path(output_folder).glob("*.*"):
+        old_file.unlink()
+    
+    # Extract and save each card WITH POSITION INFO
+    for idx, (x, y, w, h, area) in enumerate(card_contours[:12]):
+        margin = 5
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(img.shape[1], x + w + margin)
+        y2 = min(img.shape[0], y + h + margin)
+
+        card = img[y1:y2, x1:x2]
+
+        # Save with position info in filename
+        output_path = os.path.join(output_folder, 
+                                   f'card_{idx+1:02d}_x{x}_y{y}_w{w}_h{h}.png')
+        cv2.imwrite(output_path, card)
+
+    print(f"✓ Extracted {min(len(card_contours), 12)} cards to '{output_folder}/'")
+
+    # Show visualization
+    vis_img = img.copy()
+    for idx, (x, y, w, h, _) in enumerate(card_contours[:12]):
+        cv2.rectangle(vis_img, (x, y), (x+w, y+h), (0, 255, 0), 3)
+        cv2.putText(vis_img, str(idx+1), (x+10, y+40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+
+    print("\nDetected cards:")
+    cv2_imshow(vis_img)
+
+    return output_folder, image_path
+
+# ============================================================================
+# STEP 2: LOAD REFERENCE DATABASE AND MATCHING MODEL
+# ============================================================================
+
+IMG_SIZE = 224
+model = MobileNetV2(weights="imagenet", include_top=False, pooling="avg")
+
+def get_embedding(img_path):
+    """Extract feature embedding from an image."""
+    img = image.load_img(img_path, target_size=(IMG_SIZE, IMG_SIZE))
+    img_array = preprocess_input(image.img_to_array(img))
+    return model.predict(np.expand_dims(img_array, axis=0), verbose=0)[0]
+
+def parse_filename(filename):
+    """Parse card attributes from filename like 'Two_Solid_Purple_Oval.png'"""
+    parts = Path(filename).stem.split("_")
+    
+    number_map = {
+        "one": 1, "two": 2, "three": 3,
+        "1": 1, "2": 2, "3": 3
+    }
+    
+    number = number_map.get(parts[0].lower(), parts[0].lower())
+    
+    return {
+        "number": number,
+        "fill": parts[1].lower(),
+        "color": parts[2].lower(),
+        "shape": parts[3].lower()
+    }
+
+def extract_card_position(filename):
+    """Extract bounding box from filename like 'card_01_x100_y200_w150_h200.png'"""
+    parts = filename.replace('.png', '').replace('.jpg', '').split('_')
+    
+    position = {}
+    for part in parts:
+        if part.startswith('x'):
+            position['x'] = int(part[1:])
+        elif part.startswith('y'):
+            position['y'] = int(part[1:])
+        elif part.startswith('w'):
+            position['w'] = int(part[1:])
+        elif part.startswith('h'):
+            position['h'] = int(part[1:])
+    
+    return position if position else None
+
+def load_reference_database():
+    """Load all 81 reference cards."""
+    CARDS_DIR = Path("/content/SET Dataset")
+    card_db = []
+
+    print("\n" + "="*60)
+    print("Loading reference database...")
+    
+    for card_path in sorted(CARDS_DIR.glob("*.*")):
+        card_db.append({
+            "path": str(card_path),
+            "name": card_path.name,
+            "embedding": get_embedding(card_path),
+            "attrs": parse_filename(card_path.name)
+        })
+
+    print(f"✓ Loaded {len(card_db)} reference cards")
+    return card_db
+
+def match_card(img_path, card_db):
+    """Find the best matching reference card."""
+    query_emb = get_embedding(img_path)
+    
+    similarities = [
+        cosine_similarity(
+            query_emb.reshape(1, -1),
+            card["embedding"].reshape(1, -1)
+        )[0][0]
+        for card in card_db
+    ]
+    
+    best_idx = np.argmax(similarities)
+    best_match = card_db[best_idx]
+    
+    return {
+        "attrs": best_match["attrs"],
+        "reference_card": best_match["name"],
+        "similarity": float(similarities[best_idx])
+    }
+
+# ============================================================================
+# STEP 3: FIND ALL VALID SETS
+# ============================================================================
+
+def is_valid_set(card1, card2, card3):
+    """Check if three cards form a valid SET."""
+    attributes = ['number', 'fill', 'color', 'shape']
+    
+    for attr in attributes:
+        values = [card1[attr], card2[attr], card3[attr]]
+        if len(set(values)) == 2:  # Two same, one different = invalid
+            return False
+    return True
+
+def find_all_sets(df):
+    """Find all valid SETs in the dataframe."""
+    sets_found = []
+    
+    for i in range(len(df)):
+        for j in range(i + 1, len(df)):
+            for k in range(j + 1, len(df)):
+                card1 = df.iloc[i].to_dict()
+                card2 = df.iloc[j].to_dict()
+                card3 = df.iloc[k].to_dict()
+                
+                if is_valid_set(card1, card2, card3):
+                    sets_found.append({
+                        'cards': [card1['card'], card2['card'], card3['card']],
+                        'indices': [i, j, k]
+                    })
+    
+    return sets_found
+
+# ============================================================================
+# STEP 4: HIGHLIGHT SETS ON ORIGINAL IMAGE
+# ============================================================================
+
+def highlight_sets(original_image_path, df, sets_found):
+    """Draw colored rectangles around cards that form SETs with smart multi-SET handling."""
+    
+    if len(sets_found) == 0:
+        print("\n⚠ No SETs to highlight.")
+        return
+    
+    # Load original image
+    original_img = cv2.imread(original_image_path)
+    original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+    
+    # Define colors for different sets
+    set_colors = [
+        (255, 0, 0),      # Red
+        (0, 255, 0),      # Green
+        (0, 0, 255),      # Blue
+        (255, 255, 0),    # Yellow
+        (255, 0, 255),    # Magenta
+        (0, 255, 255),    # Cyan
+    ]
+    
+    # Track which cards belong to which SETs
+    card_to_sets = {}
+    for set_idx, s in enumerate(sets_found):
+        for card_name in s['cards']:
+            if card_name not in card_to_sets:
+                card_to_sets[card_name] = []
+            card_to_sets[card_name].append(set_idx)
+    
+    # Draw rectangles for each card
+    for card_name, set_indices in card_to_sets.items():
+        card_row = df[df['card'] == card_name].iloc[0]
+        position = card_row['position']
+        
+        if not position:
+            continue
+            
+        x, y, w, h = position['x'], position['y'], position['w'], position['h']
+        
+        if len(set_indices) == 1:
+            # Single SET - draw one colored rectangle
+            color = set_colors[set_indices[0] % len(set_colors)]
+            cv2.rectangle(original_img, (x, y), (x + w, y + h), color, 8)
+            
+            # Add SET label at top
+            label = f"SET #{set_indices[0] + 1}"
+            cv2.putText(original_img, label, (x, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+        else:
+            # Multiple SETs - draw nested rectangles with offset
+            thickness = 8
+            offset = 15
+            
+            for i, set_idx in enumerate(set_indices):
+                color = set_colors[set_idx % len(set_colors)]
+                
+                # Calculate offset position for each rectangle
+                x_offset = x + (i * offset)
+                y_offset = y + (i * offset)
+                w_offset = w - (i * offset * 2)
+                h_offset = h - (i * offset * 2)
+                
+                # Draw rectangle
+                cv2.rectangle(original_img, 
+                            (x_offset, y_offset), 
+                            (x_offset + w_offset, y_offset + h_offset), 
+                            color, thickness)
+            
+            # Add label showing all SET numbers
+            label = f"SETs: {', '.join([f'#{idx+1}' for idx in set_indices])}"
+            # Position label at top with background for readability
+            (text_width, text_height), _ = cv2.getTextSize(label, 
+                                                           cv2.FONT_HERSHEY_SIMPLEX, 
+                                                           1.0, 2)
+            
+            # Draw semi-transparent background for text
+            overlay = original_img.copy()
+            cv2.rectangle(overlay, (x, y - text_height - 20), 
+                         (x + text_width + 10, y - 5), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, original_img, 0.4, 0, original_img)
+            
+            # Draw text in white
+            cv2.putText(original_img, label, (x + 5, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    
+    # Display the annotated image
+    plt.figure(figsize=(16, 12))
+    plt.imshow(original_img)
+    plt.axis('off')
+    plt.title('Original Image with SETs Highlighted', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+    
+    # Save annotated image
+    output_path = "/content/sets_highlighted.jpg"
+    cv2.imwrite(output_path, cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR))
+    print(f"\n✓ Annotated image saved to: {output_path}")
+    
+    # Print summary of multi-SET cards
+    multi_set_cards = {k: v for k, v in card_to_sets.items() if len(v) > 1}
+    if multi_set_cards:
+        print(f"\n📌 Cards in multiple SETs:")
+        for card_name, set_indices in multi_set_cards.items():
+            card_row = df[df['card'] == card_name].iloc[0]
+            set_nums = ', '.join([f"#{idx+1}" for idx in set_indices])
+            print(f"   {card_name}: {card_row['number']} {card_row['fill']} {card_row['color']} {card_row['shape']}")
+            print(f"   → Part of SETs: {set_nums}")
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+print("\nStep 1: Upload your image of 12 SET cards")
+uploaded = files.upload()
+
+if not uploaded:
+    print("No file uploaded")
+else:
+    image_filename = list(uploaded.keys())[0]
+    
+    # Step 1: Extract cards
+    print("\n" + "="*60)
+    print("STEP 1: EXTRACTING CARDS")
+    print("="*60)
+    output_folder, original_path = extract_cards(image_filename)
+    
+    # Step 2: Load reference database and match cards
+    card_db = load_reference_database()
+    
+    print("\n" + "="*60)
+    print("STEP 2: MATCHING CARDS TO REFERENCE DATABASE")
+    print("="*60)
+    
+    NEW_CARDS_DIR = Path(output_folder)
+    results_list = []
+    
+    for img_path in sorted(NEW_CARDS_DIR.glob("*.*")):
+        result = match_card(img_path, card_db)
+        
+        # Display the card
+        display(IPImage(filename=str(img_path), width=300))
+        
+        print(f"{img_path.name}")
+        print(f"  {result['attrs']}")
+        print(f"  (matched: {result['reference_card']}, similarity: {result['similarity']:.3f})")
+        print()
+        
+        # Extract position from filename
+        position = extract_card_position(img_path.name)
+        
+        results_list.append({
+            'card': img_path.name,
+            'number': result['attrs']['number'],
+            'fill': result['attrs']['fill'],
+            'color': result['attrs']['color'],
+            'shape': result['attrs']['shape'],
+            'position': position
+        })
+    
+    # Create dataframe
+    df = pd.DataFrame(results_list)
+    print("\n" + "="*60)
+    print("RESULTS SUMMARY")
+    print("="*60)
+    display(df[['card', 'number', 'fill', 'color', 'shape']])
+    
+    # Step 3: Find all valid SETs
+    print("\n" + "="*60)
+    print("STEP 3: FINDING ALL VALID SETS")
+    print("="*60)
+    
+    sets_found = find_all_sets(df)
+    
+    if len(sets_found) == 0:
+        print("\n❌ No valid SETs found among these 12 cards.")
+    else:
+        print(f"\n✓ Found {len(sets_found)} valid SET(s):\n")
+        
+        for idx, s in enumerate(sets_found, 1):
+            print(f"SET #{idx}:")
+            print(f"  Cards: {', '.join(s['cards'])}")
+            
+            for card_name in s['cards']:
+                card_row = df[df['card'] == card_name].iloc[0]
+                print(f"    • {card_row['number']} {card_row['fill']} {card_row['color']} {card_row['shape']}")
+            print()
+    
+    # Step 4: Highlight SETs on original image
+    print("\n" + "="*60)
+    print("STEP 4: HIGHLIGHTING SETS ON ORIGINAL IMAGE")
+    print("="*60)
+    
+    highlight_sets(original_path, df, sets_found)
+    
+    print("\n" + "="*60)
+    print("✓ PIPELINE COMPLETE!")
+    print("="*60)
